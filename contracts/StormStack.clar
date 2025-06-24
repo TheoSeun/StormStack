@@ -197,3 +197,151 @@
         (* value -1)
         value))
 
+
+
+;; Quality Control Functions
+(define-public (report-malfunction (device-id (string-ascii 24)))
+    (let ((device (unwrap! (map-get? devices {device-id: device-id})
+                          ERR-DEVICE-NOT-FOUND))
+          (metrics (unwrap! (map-get? device-metrics {device-id: device-id})
+                           ERR-DEVICE-NOT-FOUND)))
+        (if (< (get accuracy-score device) ACCURACY-THRESHOLD)
+            (begin
+                (try! (as-contract 
+                    (stx-transfer? PENALTY-AMOUNT 
+                                 (get owner device)
+                                 contract-owner)))
+                (map-set device-metrics
+                    {device-id: device-id}
+                    (merge metrics 
+                        {total-penalties: (+ (get total-penalties metrics) u1)}))
+                (ok true))
+            ERR-INVALID-DATA)))
+
+(define-public (update-device-status (device-id (string-ascii 24)))
+    (let ((device (unwrap! (map-get? devices {device-id: device-id})
+                          ERR-DEVICE-NOT-FOUND))
+          (metrics (unwrap! (map-get? device-metrics {device-id: device-id})
+                           ERR-DEVICE-NOT-FOUND)))
+        (if (> (- stacks-block-height (get last-submission-block metrics)) 
+               MAX-INACTIVE-BLOCKS)
+            (begin
+                (map-set devices
+                    {device-id: device-id}
+                    (merge device {accuracy-score: u0}))
+                (ok true))
+            ERR-INVALID-DATA)))
+
+
+;; Submit weather data
+(define-public (submit-data (device-id (string-ascii 24))
+                           (timestamp uint)
+                           (temperature int)
+                           (humidity uint)
+                           (pressure uint)
+                           (wind-speed uint))
+    (let ((device (unwrap! (map-get? devices {device-id: device-id})
+                          ERR-DEVICE-NOT-FOUND)))
+        (if (is-eq tx-sender (get owner device))
+            (begin
+                (map-set weather-data
+                    {
+                        device-id: device-id,
+                        timestamp: timestamp
+                    }
+                    {
+                        temperature: temperature,
+                        humidity: humidity,
+                        pressure: pressure,
+                        wind-speed: wind-speed,
+                        validated: false
+                    })
+                (map-set devices
+                    {device-id: device-id}
+                    (merge device 
+                        {total-submissions: (+ (get total-submissions device) u1)}))
+                (ok true))
+            ERR-NOT-AUTHORIZED)))
+
+;; Read-only functions
+(define-read-only (get-device-info (device-id (string-ascii 24)))
+    (map-get? devices {device-id: device-id}))
+
+(define-read-only (get-weather-data (device-id (string-ascii 24)) 
+                                   (timestamp uint))
+    (map-get? weather-data {device-id: device-id, timestamp: timestamp}))
+
+(define-read-only (get-consensus-data (location-hash (string-ascii 16)) 
+                                     (timestamp uint))
+    (map-get? consensus-data {location-hash: location-hash, timestamp: timestamp}))
+
+
+
+
+;; Device lookup functions
+(define-read-only (get-device-by-owner (owner principal))
+    (let ((device-id (map-get? device-owners owner)))
+        {device-id: (default-to "" device-id)}))
+
+(define-read-only (get-owner-device (owner principal))
+    (map-get? device-owners owner))
+
+;; Vote function update
+(define-public (vote-on-proposal (proposal-id uint) (vote-value bool))
+    (let ((proposal (unwrap! (map-get? proposals {proposal-id: proposal-id})
+                            ERR-INVALID-PROPOSAL))
+          (device-id (unwrap! (get-owner-device tx-sender)
+                             ERR-NOT-AUTHORIZED))
+          (device (unwrap! (get-device-info device-id)
+                          ERR-NOT-AUTHORIZED)))
+        (if (and
+            (is-eq (get status proposal) "active")
+            (< stacks-block-height (get end-block proposal))
+            (is-none (map-get? votes-cast 
+                              {proposal-id: proposal-id, voter: tx-sender})))
+            (begin
+                (map-set votes-cast
+                    {proposal-id: proposal-id, voter: tx-sender}
+                    {vote: vote-value})
+                (map-set proposals
+                    {proposal-id: proposal-id}
+                    (merge proposal
+                        {
+                            votes-for: (+ (get votes-for proposal) 
+                                        (if vote-value u1 u0)),
+                            votes-against: (+ (get votes-against proposal)
+                                           (if vote-value u0 u1))
+                        }))
+                (ok true))
+            ERR-INVALID-PROPOSAL)))
+
+;; Create proposal function update
+(define-public (create-proposal 
+    (title (string-ascii 50))
+    (description (string-ascii 500))
+    (parameter (string-ascii 20))
+    (new-value uint))
+    (let ((proposal-id (+ (var-get proposal-counter) u1))
+          (device-id (unwrap! (get-owner-device tx-sender)
+                             ERR-NOT-AUTHORIZED))
+          (device (unwrap! (get-device-info device-id)
+                          ERR-NOT-AUTHORIZED)))
+        (if (>= (get stake device) (* min-stake u2))
+            (begin
+                (map-set proposals
+                    {proposal-id: proposal-id}
+                    {
+                        proposer: tx-sender,
+                        title: title,
+                        description: description,
+                        parameter: parameter,
+                        new-value: new-value,
+                        votes-for: u0,
+                        votes-against: u0,
+                        status: "active",
+                        end-block: (+ stacks-block-height u1440)
+                    })
+                (var-set proposal-counter proposal-id)
+                (ok proposal-id))
+            ERR-INSUFFICIENT-STAKE)))
+
